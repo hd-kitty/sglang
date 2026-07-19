@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import signal
 
 # Registered tests run with the strict config-mutation guard: bare
 # server_args assignments after resolution raise (use ServerArgs.override).
@@ -773,8 +774,16 @@ def _subprocess_popen_with_outputs(
     if torch.cuda.is_initialized():
         torch.cuda.empty_cache()
 
+    # Each server gets its own session (= its own process group). sglang
+    # schedulers detach from the launcher's process tree during startup
+    # (reparented to PID 1), so a parent->child tree walk cannot enumerate
+    # them — but they keep the session's process-group id forever, which
+    # makes os.killpg() the one signal that reliably reaches every process
+    # of a launched server.
     if not return_stdout_stderr:
-        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+        return subprocess.Popen(
+            command, stdout=None, stderr=None, env=env, start_new_session=True
+        )
 
     process = subprocess.Popen(
         command,
@@ -783,6 +792,7 @@ def _subprocess_popen_with_outputs(
         env=env,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
 
     def _dump(src, sinks):
@@ -882,6 +892,38 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+# Last server launched on each port by this test process. A dying or hung
+# predecessor on the same port plan fails the next launch with "rpc_port ...
+# is used by a process already", so it must be fully signalled first.
+_launched_servers_by_port: dict = {}
+
+
+def _kill_server_session(pid: int):
+    """SIGKILL every process in a launched server's session.
+
+    Servers are launched with ``start_new_session=True``, so the launcher's
+    pid is also the session's process-group id, and ``os.killpg`` reaches
+    schedulers that detached from the process tree (reparented to PID 1) —
+    the ones ``kill_process_tree``'s tree walk misses. Pids of dead leaders
+    cannot be recycled while the group has members, so a stale pid either
+    hits the right group or raises ProcessLookupError.
+    """
+    if pid == os.getpgid(0):
+        return
+    try:
+        if os.getpgid(pid) != pid:
+            # Not a session leader we created: leave it to kill_process_tree.
+            return
+    except ProcessLookupError:
+        # The leader is gone, but its group can still have members (that is
+        # the leftover case); killpg addresses the group id directly.
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -931,6 +973,16 @@ def popen_launch_server(
     # kill_process_tree() while GPU teardown completes; give CI launches
     # teardown-sized patience (see wait_port_available).
     env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
+    _, _, _port_str = base_url.split(":")
+    predecessor = _launched_servers_by_port.get(int(_port_str))
+    if predecessor is not None:
+        # A previous server on this port (e.g. the prior test class's) can
+        # hold the derived port plan past its kill_process_tree() — briefly
+        # during GPU teardown, or indefinitely when a detached scheduler was
+        # never signalled. Kill its whole session before reusing the ports;
+        # wait_port_available in the new server then absorbs the teardown.
+        _kill_server_session(predecessor.pid)
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -985,6 +1037,7 @@ def popen_launch_server(
 
     # First launch attempt
     process = _launch_server_process(command, env, return_stdout_stderr, model)
+    _launched_servers_by_port[int(_port_str)] = process
     success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
 
     # If offline launch failed and offline was enabled, retry with online mode
@@ -993,11 +1046,14 @@ def popen_launch_server(
             f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
 
-        # Kill failed process
+        # Kill failed process — the whole session, so schedulers that
+        # detached from the process tree are signalled too; the relaunch
+        # below reuses the same port plan.
         try:
             if process.poll() is None:
                 kill_process_tree(process.pid)
-            else:
+            _kill_server_session(process.pid)
+            if process.poll() is None:
                 process.wait(timeout=5)
         except Exception as e:
             print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
@@ -1013,6 +1069,7 @@ def popen_launch_server(
         # Retry with online mode
         env["HF_HUB_OFFLINE"] = "0"
         process = _launch_server_process(command, env, return_stdout_stderr, model)
+        _launched_servers_by_port[int(_port_str)] = process
         success, error_msg = _wait_for_server_health(
             process, base_url, api_key, timeout
         )
